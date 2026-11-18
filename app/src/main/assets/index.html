@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Altyazı Çevirmen</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #000; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+  #video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #guide { position: fixed; border: 2px dashed rgba(255,215,0,.8); pointer-events: none; display: none; }
+  #top { position: fixed; top: 0; left: 0; right: 0; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+  #tr { background: rgba(0,0,0,.78); border-radius: 12px; padding: 12px 14px; font-size: 24px; line-height: 1.3; font-weight: 600; min-height: 56px; text-shadow: 0 1px 2px #000; }
+  #en { font-size: 14px; color: #bbb; font-weight: 400; margin-top: 6px; }
+  #status { font-size: 12px; color: #9f9; background: rgba(0,0,0,.6); align-self: flex-start; padding: 3px 8px; border-radius: 8px; }
+  #status.err { color: #f88; }
+  #bar { position: fixed; bottom: 0; left: 0; right: 0; padding: 12px; display: flex; gap: 10px; justify-content: center; background: linear-gradient(transparent, rgba(0,0,0,.7)); }
+  button { border: 0; border-radius: 28px; padding: 14px 22px; font-size: 17px; font-weight: 700; color: #fff; background: #2563eb; }
+  button.stop { background: #dc2626; }
+  button.sec { background: #374151; }
+  #settings { position: fixed; inset: 0; background: rgba(0,0,0,.94); padding: 20px; overflow-y: auto; display: none; }
+  #settings h2 { margin-bottom: 14px; }
+  label { display: block; font-size: 14px; color: #ccc; margin: 14px 0 6px; }
+  input, select { width: 100%; padding: 12px; font-size: 16px; border-radius: 10px; border: 1px solid #444; background: #111; color: #fff; }
+  .hint { font-size: 12px; color: #888; margin-top: 4px; }
+  .row { display: flex; gap: 10px; margin-top: 22px; }
+  .row button { flex: 1; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<div id="guide"></div>
+
+<div id="top">
+  <div id="tr">Ayarlar'dan Gemini API anahtarını gir, sonra Başlat'a bas.<div id="en"></div></div>
+  <div id="status">Hazır</div>
+</div>
+
+<div id="bar">
+  <button id="startBtn">▶ Başlat</button>
+  <button id="setBtn" class="sec">⚙ Ayarlar</button>
+</div>
+
+<div id="settings">
+  <h2>Ayarlar</h2>
+  <label>Gemini API anahtarı</label>
+  <input id="apiKey" type="password" placeholder="AIza..." autocomplete="off">
+  <div class="hint">aistudio.google.com/apikey adresinden ücretsiz alınır. Sadece bu telefonda saklanır.</div>
+
+  <label>Model</label>
+  <input id="model" type="text">
+  <div class="hint">Varsayılan: gemini-3.5-flash-lite (en hızlı). Daha isabetli için: gemini-3.6-flash</div>
+
+  <label>Hedef dil</label>
+  <input id="lang" type="text">
+
+  <label>Tarama alanı</label>
+  <select id="region">
+    <option value="1">Tüm görüntü</option>
+    <option value="0.5">Alt yarı</option>
+    <option value="0.35">Alt üçte bir</option>
+  </select>
+
+  <label>Tarama aralığı (saniye)</label>
+  <input id="interval" type="number" min="0.5" step="0.5">
+  <div class="hint">Görüntü değişmezse API çağrılmaz (kota tasarrufu).</div>
+
+  <div class="row">
+    <button id="saveBtn">Kaydet</button>
+    <button id="closeBtn" class="sec">Kapat</button>
+  </div>
+</div>
+
+<canvas id="cap" style="display:none"></canvas>
+<canvas id="thumb" width="48" height="12" style="display:none"></canvas>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), trBox = $('tr'), statusEl = $('status');
+const DEFAULTS = { apiKey: '', model: 'gemini-3.5-flash-lite', lang: 'Türkçe', region: '0.5', interval: '1.5' };
+
+function load() {
+  const c = {};
+  for (const k in DEFAULTS) {
+    let v = null;
+    try { v = localStorage.getItem('ac_' + k); } catch (e) {}
+    c[k] = v !== null ? v : DEFAULTS[k];
+  }
+  return c;
+}
+let cfg = load();
+
+function fillForm() {
+  for (const k in DEFAULTS) $(k).value = cfg[k];
+}
+function saveForm() {
+  for (const k in DEFAULTS) {
+    cfg[k] = $(k).value.trim() || DEFAULTS[k];
+    try { localStorage.setItem('ac_' + k, cfg[k]); } catch (e) {}
+  }
+  if (!$('apiKey').value.trim()) cfg.apiKey = '';
+  updateGuide();
+}
+
+function setStatus(t, err) { statusEl.textContent = t; statusEl.className = err ? 'err' : ''; }
+function showText(tr, en) {
+  trBox.textContent = tr;
+  const e = document.createElement('div'); e.id = 'en'; e.textContent = en || '';
+  trBox.appendChild(e);
+}
+
+// --- Camera ---
+let stream = null;
+async function startCamera() {
+  if (stream) return;
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  await new Promise(r => video.videoWidth ? r() : video.onloadedmetadata = r);
+  updateGuide();
+}
+function stopCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  $('guide').style.display = 'none';
+}
+
+// Yellow box showing the scanned area on screen
+function updateGuide() {
+  const g = $('guide');
+  if (!stream || !video.videoWidth) { g.style.display = 'none'; return; }
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const W = window.innerWidth, H = window.innerHeight;
+  const s = Math.min(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s, dx = (W - dw) / 2, dy = (H - dh) / 2;
+  const frac = parseFloat(cfg.region) || 1;
+  g.style.left = dx + 'px'; g.style.width = dw + 'px';
+  g.style.top = (dy + dh * (1 - frac)) + 'px'; g.style.height = (dh * frac) + 'px';
+  g.style.display = 'block';
+}
+window.addEventListener('resize', () => setTimeout(updateGuide, 300));
+
+// --- Frame capture ---
+function grabFrame() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const frac = parseFloat(cfg.region) || 1;
+  const sy = Math.round(vh * (1 - frac)), sh = Math.round(vh * frac);
+  const scale = Math.min(1, 1280 / vw);
+  const c = $('cap');
+  c.width = Math.round(vw * scale); c.height = Math.round(sh * scale);
+  c.getContext('2d').drawImage(video, 0, sy, vw, sh, 0, 0, c.width, c.height);
+
+  // tiny grayscale thumbnail for change detection
+  const t = $('thumb'), tc = t.getContext('2d', { willReadFrequently: true });
+  tc.drawImage(c, 0, 0, t.width, t.height);
+  const d = tc.getImageData(0, 0, t.width, t.height).data;
+  const g = new Uint8Array(t.width * t.height);
+  for (let i = 0; i < g.length; i++) g[i] = (d[i*4] * 3 + d[i*4+1] * 6 + d[i*4+2]) / 10;
+
+  return { b64: c.toDataURL('image/jpeg', 0.75).split(',')[1], thumb: g };
+}
+function diff(a, b) {
+  if (!a || !b) return 999;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return s / a.length;
+}
+
+// --- Gemini ---
+async function translate(b64) {
+  const prompt =
+    'This image is a camera photo of a screen (TV, monitor or phone) showing a video. ' +
+    'Find the English subtitle/caption text in it (usually near the bottom). ' +
+    'Translate it naturally into ' + cfg.lang + '. ' +
+    'Reply ONLY with JSON: {"en": "<original subtitle>", "tr": "<translation>"}. ' +
+    'If there is no readable subtitle text, reply {"en": "", "tr": ""}.';
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+    encodeURIComponent(cfg.model) + ':generateContent';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.apiKey },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [
+        { inline_data: { mime_type: 'image/jpeg', data: b64 } },
+        { text: prompt }
+      ]}],
+      generationConfig: { responseMimeType: 'application/json' }
+    })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data.error && data.error.message) || ('HTTP ' + res.status);
+    throw new Error(msg);
+  }
+  const parts = (((data.candidates || [])[0] || {}).content || {}).parts || [];
+  const text = parts.filter(p => !p.thought && p.text).map(p => p.text).join('').trim();
+  try {
+    const j = JSON.parse(text.replace(/^```(json)?|```$/g, '').trim());
+    return { en: (j.en || '').trim(), tr: (j.tr || '').trim() };
+  } catch (e) {
+    return { en: '', tr: text };
+  }
+}
+
+// --- Main loop ---
+let running = false, lastThumb = null, lastTr = '';
+async function loop() {
+  while (running) {
+    const t0 = Date.now();
+    try {
+      if (video.videoWidth) {
+        const f = grabFrame();
+        if (diff(f.thumb, lastThumb) > 4) {
+          setStatus('Çevriliyor…');
+          const r = await translate(f.b64);
+          lastThumb = f.thumb;
+          if (r.tr && r.tr !== lastTr) { showText(r.tr, r.en); lastTr = r.tr; }
+          setStatus(r.tr ? 'Canlı · ' + ((Date.now() - t0) / 1000).toFixed(1) + ' sn' : 'Altyazı bulunamadı');
+        } else {
+          setStatus('Canlı · değişiklik yok');
+        }
+      }
+    } catch (e) {
+      setStatus('Hata: ' + e.message, true);
+      lastThumb = null;
+      if (/API key|API_KEY|permission|403|401/i.test(e.message)) { stop(); break; }
+    }
+    const wait = Math.max(0, (parseFloat(cfg.interval) || 1.5) * 1000 - (Date.now() - t0));
+    await new Promise(r => setTimeout(r, wait));
+  }
+}
+
+async function start() {
+  if (!cfg.apiKey) { openSettings(); setStatus('Önce API anahtarını gir', true); return; }
+  try {
+    await startCamera();
+  } catch (e) {
+    setStatus('Kamera açılamadı: ' + e.message, true); return;
+  }
+  running = true; lastThumb = null;
+  $('startBtn').textContent = '■ Durdur'; $('startBtn').className = 'stop';
+  showText('Altyazıya doğrult…', '');
+  loop();
+}
+function stop() {
+  running = false;
+  stopCamera();
+  $('startBtn').textContent = '▶ Başlat'; $('startBtn').className = '';
+  setStatus('Durduruldu');
+}
+
+function openSettings() { fillForm(); $('settings').style.display = 'block'; }
+function closeSettings() { $('settings').style.display = 'none'; }
+
+$('startBtn').onclick = () => running ? stop() : start();
+$('setBtn').onclick = openSettings;
+$('closeBtn').onclick = closeSettings;
+$('saveBtn').onclick = () => { saveForm(); closeSettings(); setStatus('Kaydedildi'); };
+document.addEventListener('visibilitychange', () => { if (document.hidden && running) stop(); });
+
+if (!cfg.apiKey) openSettings();
+</script>
+</body>
+</html>
